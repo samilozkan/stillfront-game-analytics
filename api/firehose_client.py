@@ -19,6 +19,27 @@ except ImportError:
     BOTO3_AVAILABLE = False
     logger.warning("boto3 not available, using mock client")
 
+class DeadLetterQueue:
+    """Failed events için temporary queue."""
+    def __init__(self, max_size: int = 1000):
+        self.failed_events = []
+        self.max_size = max_size
+    
+    def add_failed_event(self, event: Dict[str, Any], error: str):
+        """Add failed event to queue."""
+        if len(self.failed_events) >= self.max_size:
+            # En eski eventi sil
+            self.failed_events.pop(0)
+        
+        failed_event = {
+            "event": event,
+            "error": error,
+            "failed_at": datetime.utcnow().isoformat(),
+            "retry_count": 0
+        }
+        self.failed_events.append(failed_event)
+        logger.warning(f"Event added to DLQ: {event.get('event_id')}")
+
 
 class FirehoseClient:
     """AWS Kinesis Firehose client."""
@@ -47,6 +68,15 @@ class FirehoseClient:
                 logger.error(f"Failed to create AWS client: {e}")
                 self.client = MockFirehoseClient()
                 logger.info("Falling back to mock client")
+                self.dlq = DeadLetterQueue() # Temporary queue for failed events
+                
+    
+    # Decorator to retry on exceptions with exponential backoff
+    @backoff.on_exception(
+    backoff.expo,
+    Exception,
+    max_tries=3
+    )
     
     def send_event(self, event_data: Dict[str, Any]) -> bool:
         """Send single event to Firehose."""
@@ -77,6 +107,7 @@ class FirehoseClient:
                 
         except Exception as e:
             logger.error(f"Failed to send event to Firehose: {e}")
+            self.dlq.add_failed_event(event_data, str(e))
             return False
     
     def health_check(self) -> bool:
@@ -96,6 +127,59 @@ class FirehoseClient:
             logger.error(f"Health check failed: {e}")
             return False
 
+    def send_events_batch(self, events: List[Dict[str, Any]]) -> bool:
+        """Send multiple events in batch."""
+        if not events:
+            return True
+    
+        logger.info(f"Sending batch of {len(events)} events")
+
+        # AWS Firehose max 500 records per batch
+        batch_size = 500
+        all_success = True
+    
+        for i in range(0, len(events), batch_size):
+            batch = events[i:i + batch_size]
+            success = self._send_single_batch(batch)
+            if not success:
+                all_success = False
+    
+        return all_success
+
+    def _send_single_batch(self, events: List[Dict[str, Any]]) -> bool:
+        """Send a single batch of events."""
+        records = []
+        for event in events:
+            record_data = {
+                'ingestion_timestamp': datetime.utcnow().isoformat(),
+                'source': 'game_analytics_api',
+                **event
+            }
+            records.append({'Data': json.dumps(record_data) + '\n'})
+    
+        try:
+            if hasattr(self.client, 'put_record_batch'):
+                # Real AWS client
+                response = self.client.put_record_batch(
+                    DeliveryStreamName=self.stream_name,
+                    Records=records
+                )
+                failed_count = response.get('FailedPutCount', 0)
+                if failed_count > 0:
+                    logger.warning(f"Batch had {failed_count} failed records")
+                return failed_count == 0
+            else:
+                # Mock client - simulate batch success
+                for event in events:
+                    self.client.send_event(event)
+                return True
+            
+        except Exception as e:
+            logger.error(f"Batch send failed: {e}")
+            # Add all events to DLQ
+            for event in events:
+                self.dlq.add_failed_event(event, str(e))
+            return False
 
 class MockFirehoseClient:
     """Mock Firehose client for testing."""
